@@ -1,0 +1,32 @@
+name: Tag on version bump
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version and create tag if new
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="v${version}"
+
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists — skipping."
+          else
+            echo "Creating tag $tag"
+            git tag "$tag"
+            git push origin "$tag"
+          fi
