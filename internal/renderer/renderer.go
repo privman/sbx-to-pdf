@@ -49,6 +49,9 @@ type Options struct {
 	OutputPath    string
 	OmitSceneNums bool
 	OmitPageNums  bool
+	Title         string
+	ByLines       []string
+	Contacts      []string
 }
 
 type Renderer struct {
@@ -67,6 +70,10 @@ func Render(elements []model.Element, opts Options) error {
 	r.pdf.SetAutoPageBreak(false, marginBottom)
 	r.pdf.SetFont("Courier", "", fontSize)
 
+	if opts.Title != "" {
+		r.drawTitlePage()
+	}
+
 	r.newPage()
 
 	for i := 0; i < len(elements); i++ {
@@ -83,12 +90,14 @@ func Render(elements []model.Element, opts Options) error {
 				r.newPage()
 			}
 			r.drawElement(elem)
+			r.addGapAfter(elements, i)
 			continue
 		}
 
 		// Paragraph element (Action or Dialogue): check if it fits.
 		if r.y+elemH <= pageH-marginBottom {
 			r.drawElement(elem)
+			r.addGapAfter(elements, i)
 			continue
 		}
 
@@ -103,9 +112,68 @@ func Render(elements []model.Element, opts Options) error {
 			r.newPage()
 		}
 		r.drawElement(elem)
+		r.addGapAfter(elements, i)
 	}
 
 	return r.pdf.OutputFileAndClose(opts.OutputPath)
+}
+
+func (r *Renderer) drawTitlePage() {
+	r.pdf.AddPage()
+	centerX := pageW / 2
+
+	// Title: ~1/3 down the page, ALL CAPS, underlined.
+	titleY := pageH / 3
+	titleText := strings.ToUpper(r.opts.Title)
+	r.pdf.SetFont("Courier", "BU", fontSize)
+	titleW := r.pdf.GetStringWidth(titleText)
+	r.pdf.Text(centerX-titleW/2, titleY, titleText)
+
+	y := titleY + lineHeight*3
+
+	// "Written by" + author names.
+	if len(r.opts.ByLines) > 0 {
+		r.pdf.SetFont("Courier", "", fontSize)
+		wb := "Written by"
+		wbW := r.pdf.GetStringWidth(wb)
+		r.pdf.Text(centerX-wbW/2, y, wb)
+		y += lineHeight * 2
+
+		for _, name := range r.opts.ByLines {
+			r.pdf.SetFont("Courier", "", fontSize)
+			nw := r.pdf.GetStringWidth(name)
+			r.pdf.Text(centerX-nw/2, y, name)
+			y += lineHeight
+		}
+	}
+
+	// Contacts: bottom-left, left-aligned.
+	if len(r.opts.Contacts) > 0 {
+		contactY := pageH - marginBottom - float64(len(r.opts.Contacts))*lineHeight
+		r.pdf.SetFont("Courier", "", fontSize)
+		for _, c := range r.opts.Contacts {
+			parts := strings.SplitN(c, ":", 2)
+			line := c
+			if len(parts) == 2 {
+				line = strings.TrimSpace(parts[0]) + ": " + strings.TrimSpace(parts[1])
+			}
+			r.pdf.Text(marginLeft, contactY, line)
+			contactY += lineHeight
+		}
+	}
+}
+
+// addGapAfter adds inter-element spacing unless the current+next elements
+// form a tight block (Character→Dialogue, Parenthetical→Dialogue, Dialogue→Parenthetical).
+func (r *Renderer) addGapAfter(elements []model.Element, i int) {
+	cur := elements[i].Type
+	if cur == model.Character || cur == model.Parenthetical {
+		return
+	}
+	if cur == model.Dialogue && i+1 < len(elements) && elements[i+1].Type == model.Parenthetical {
+		return
+	}
+	r.y += elementGap
 }
 
 // newPage adds a page and resets y. Draws page number if needed.
@@ -258,26 +326,19 @@ func (r *Renderer) drawElement(elem *model.Element) {
 
 	// Scene numbers for scene headings.
 	if elem.Type == model.SceneHeading && !r.opts.OmitSceneNums && elem.SceneNum != "" {
-		r.pdf.SetFont("Courier", "", fontSize)
+		r.pdf.SetFont("Courier", "B", fontSize)
 		r.pdf.Text(sceneNumLeftX, r.y+fontSize, elem.SceneNum)
-		// Right scene number: right-align.
 		numW := r.pdf.GetStringWidth(elem.SceneNum)
 		r.pdf.Text(sceneNumRightX-numW, r.y+fontSize, elem.SceneNum)
 	}
 
 	if elem.Type == model.Transition {
 		r.drawTransition(elem)
-		r.y += elementGap
 		return
 	}
 
 	// Render with bold/italic span support.
 	r.drawSpans(elem, left, width)
-
-	// No gap after Character or Parenthetical — they bind tightly with Dialogue.
-	if elem.Type != model.Character && elem.Type != model.Parenthetical {
-		r.y += elementGap
-	}
 }
 
 func (r *Renderer) drawTransition(elem *model.Element) {
@@ -291,6 +352,7 @@ func (r *Renderer) drawTransition(elem *model.Element) {
 // drawSpans renders element text with inline bold/italic, word-wrapped.
 func (r *Renderer) drawSpans(elem *model.Element, left, width float64) {
 	forceUpper := elem.Type == model.SceneHeading || elem.Type == model.Character
+	forceBold := elem.Type == model.SceneHeading
 	wrapParens := elem.Type == model.Parenthetical
 
 	// Build a flat list of styled words for wrapping.
@@ -301,14 +363,35 @@ func (r *Renderer) drawSpans(elem *model.Element, left, width float64) {
 	}
 
 	var words []styledWord
+	prevEndedWithSpace := true
 	for _, sp := range elem.Spans {
 		t := normalizeText(sp.Text)
 		if forceUpper {
 			t = strings.ToUpper(t)
 		}
+		bold := sp.Bold || forceBold
+		italic := sp.Italic
+
+		if len(t) == 0 {
+			continue
+		}
+
+		startsWithSpace := t[0] == ' ' || t[0] == '\t' || t[0] == '\n' || t[0] == '\r'
+		endsWithSpace := t[len(t)-1] == ' ' || t[len(t)-1] == '\t' || t[len(t)-1] == '\n' || t[len(t)-1] == '\r'
 		parts := strings.Fields(t)
-		for _, p := range parts {
-			words = append(words, styledWord{text: p, bold: sp.Bold, italic: sp.Italic})
+
+		for i, p := range parts {
+			if i == 0 && !startsWithSpace && !prevEndedWithSpace && len(words) > 0 {
+				words[len(words)-1].text += p
+			} else {
+				words = append(words, styledWord{text: p, bold: bold, italic: italic})
+			}
+		}
+
+		if len(parts) == 0 {
+			prevEndedWithSpace = true
+		} else {
+			prevEndedWithSpace = endsWithSpace
 		}
 	}
 
